@@ -5,8 +5,7 @@ Adapted Travel Sustainability Index (TSI) for the 118 freguesias of the
 Lisbon Metropolitan Area (AML), based on journey-to-work/study modal-share
 data from Censos 2021 (INE), now extended with a car-ownership component.
 
-The original TSI (D.A. Smith, UCL/CASA, 2025) combines car-ownership and
-modal-share data for England & Wales:
+The original TSI formula combines car-ownership and modal-share data:
 
     TSI = 1.25 * ( (2*pct_zero_car + pct_active + pct_pt + (100 - pct_car)) / 5 )
 
