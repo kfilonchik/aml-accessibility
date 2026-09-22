@@ -82,7 +82,7 @@ import pandas as pd
 
 from config import BGRI_PATH, CRS_PT, CRS_WGS, DATA
 
-STATS_DIR = DATA / "statistics"
+STATS_DIR = DATA / "ine_statistics"
 
 VEH_OWNERSHIP_PATH = STATS_DIR / "IndicatorsFreguesia.geojson"
 OUT_GEOJSON = DATA / "AML_TSI_parishes.geojson"
