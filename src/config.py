@@ -8,9 +8,9 @@ import datetime as dt
 from pathlib import Path
 
 BASE      = Path(__file__).parent.parent   # repo root (src/ lives directly under it)
-DATA      = BASE / "data"
+DATA      = Path("/NVMESTORAGE/DATA/aml_project")
 GTFS_ZIPS = DATA / "gtfs"
-MATRICES  = BASE / "output/travel_matrix"
+MATRICES  = DATA / "travel_matrix"
 MATRICES.mkdir(parents=True, exist_ok=True)
 
 CRS_PT  = "EPSG:3763"   # PT-TM06, projected, metres — used for analysis/joins
