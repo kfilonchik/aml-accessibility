@@ -36,13 +36,14 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
-from config import BGRI_PATH, BASE, MATRICES
+from config import BGRI_PATH, BASE, DATA, MATRICES
 
 WEBMAP_DIR = BASE / "output" / "webmap"
 WEBMAP_DIR.mkdir(parents=True, exist_ok=True)
 
-STATS_DIR = BASE / "data" / "statistics"
-DATA = BASE / "data"
+STATS_DIR = DATA / "ine_statistics"
+PARISH_CONVERSION_PATH = DATA / "polygons" / "dtmnfr21_to_2024_parish_name_conversion.csv"
+PARISH_2024_GEOM_PATH = STATS_DIR / "IndicatorsFreguesia.geojson"
 
 POP_THRESHOLDS = [0.10, 0.25, 0.50]  # fractions of total AML population
 
@@ -92,28 +93,59 @@ def main() -> None:
         n_unreached = bgri[col].isna().sum()
         print(f"    {col}: {n_unreached} / {len(bgri)} BGRI cells never reach that share within 120 min")
 
-    print("\n[2] Rolling up travel time to parish (population-weighted mean) …")
+    print("\n[2] Rolling up travel time to parish (population-weighted mean, 2016→2024 parish conversion) …")
     parish_src = bgri.dropna(subset=["Dicofre"]).copy()
     parish_src["Dicofre"] = parish_src["Dicofre"].astype(str).str.zfill(6)
+
+    # Same 2016 (dtmnfr16) -> 2024 (dtmnfr24) conversion as 04_accessibility_metric.py:
+    # weight=1 for the 114 non-split parishes, fractional (summing to 1 per
+    # old code) for the 4 that split into multiple 2024 parishes. Applied to
+    # both the numerator and denominator of the population-weighted mean.
+    conversion = pd.read_csv(PARISH_CONVERSION_PATH, dtype=str)
+    conversion["weight"] = conversion["weight"].astype(float)
+    conversion = conversion.rename(columns={"dtmnfr16": "Dicofre"})
+
+    parish_src = parish_src.merge(
+        conversion[["Dicofre", "dtmnfr24", "weight"]], on="Dicofre", how="left",
+    )
+    n_unmatched = parish_src["dtmnfr24"].isna().sum()
+    if n_unmatched:
+        print(f"    WARNING: {n_unmatched} BGRI rows have a Dicofre not found in the 2016->2024 "
+              f"conversion table -- dropping them from the rollup")
+        parish_src = parish_src.dropna(subset=["dtmnfr24"])
+
     tt_by_parish_parts = {}
     for col in tt_cols:
         valid = parish_src.dropna(subset=[col])  # exclude from both numerator AND denominator
-        g = valid.assign(weighted=valid[col] * valid["N_INDIVIDUOS"]).groupby("Dicofre")
-        tt_by_parish_parts[col] = g["weighted"].sum() / g["N_INDIVIDUOS"].sum().replace(0, np.nan)
+        pop_w = valid["N_INDIVIDUOS"] * valid["weight"]
+        numerator = (valid[col] * pop_w).groupby(valid["dtmnfr24"]).sum()
+        denominator = pop_w.groupby(valid["dtmnfr24"]).sum()
+        tt_by_parish_parts[col] = numerator / denominator.replace(0, np.nan)
     tt_by_parish = pd.DataFrame(tt_by_parish_parts)
+    tt_by_parish.index.name = "Dicofre"
 
     print("\n[3] Joining sustainability, mode share, accessibility and travel time …")
     access = pd.read_csv(STATS_DIR / "AML_accessibility_parishes.csv", dtype={"Dicofre": str})
     for col in tt_cols:
         access[col] = access["Dicofre"].map(tt_by_parish[col])
 
-    parish_geom = (
-        bgri.dropna(subset=["Dicofre"])
-        .assign(Dicofre=lambda d: d["Dicofre"].astype(str).str.zfill(6))[["Dicofre", "geometry"]]
-        .dissolve("Dicofre")
-        .reset_index()
-    )
-    parish = parish_geom.merge(access, on="Dicofre", how="inner")
+    # Geometry: the real 2024 parish boundary layer (same one used by
+    # 04_accessibility_metric.py), not BGRI polygons dissolved by the old
+    # Dicofre code -- conversion weights are for statistic redistribution
+    # only and must never be used to approximate geometry.
+    parishes_2024 = gpd.read_file(PARISH_2024_GEOM_PATH)
+    parishes_2024["Dicofre"] = parishes_2024["id"].astype(str).str.zfill(6)
+    assert parishes_2024["Dicofre"].duplicated().sum() == 0, "duplicated Dicofre in 2024 geometry layer"
+    assert access["Dicofre"].duplicated().sum() == 0, "duplicated Dicofre in accessibility/statistics table"
+    unmatched_stats = set(access["Dicofre"]) - set(parishes_2024["Dicofre"])
+    print(f"    Statistics codes with no match in 2024 geometry layer: {len(unmatched_stats)} "
+          f"{sorted(unmatched_stats) if unmatched_stats else ''}")
+
+    parish = parishes_2024[["Dicofre", "geometry"]].merge(access, on="Dicofre", how="left")
+    assert len(parish) == len(parishes_2024), "row count changed across merge -- Dicofre not unique somewhere"
+    n_no_access = parish["access"].isna().sum()
+    print(f"    2024 geometry parishes with no accessibility value after join: {n_no_access}")
+
     centroid_pt = parish.geometry.representative_point().to_crs("EPSG:4326")
     parish["lon"] = centroid_pt.x
     parish["lat"] = centroid_pt.y
