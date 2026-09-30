@@ -223,3 +223,12 @@ conda env export --from-history > r5geo_environment_minimal.yml
 ```
 
 ---
+
+## 9. How to run the webmap?
+
+```bash
+cd "/NVMESTORAGE/DATA/aml_project/webmap" && python3 -m http.server 8000
+```
+
+http://localhost:8000/aml_transit_atlas.html
+ 
