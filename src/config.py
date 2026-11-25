@@ -29,7 +29,7 @@ FEEDS: dict[str, str] = {
     "carris_municipal": "carris_municip.zip",
 #    "Transportes Alentejo Litoral" : "TranspAlentejoLitoral.zip",
 #    "Rodoviária do Tejo" : "RMTejoII.zip",
-    "Barraqueiro Rodoeste" : "RDO_reconstructed_20261110.zip",
+#   "Barraqueiro Rodoeste" : "RDO_reconstructed_20261110.zip",
 }
 
 '''# ── Input geometries ──
