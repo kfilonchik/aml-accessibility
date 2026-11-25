@@ -32,6 +32,7 @@ import r5py
 from config import (
     CRS_WGS, DEPARTURE_DATETIME, DEPARTURE_WINDOW, FEEDS, GTFS_ZIPS, MATRICES,
     ORIGIN_BATCH_SIZE, MAX_MATRIX_PAIRS_PER_BATCH, OSM_PBF_AML_PATH, BGRI_PATH, BGRI_BUFFER_PATH,
+    MAX_TRAVEL_TIME, MAX_WALKING_TIME
 )
 
 
@@ -88,10 +89,6 @@ def load_bgri_datasets() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     if overlap:
         raise ValueError(f"AML and buffer datasets share {len(overlap)} BGRI2021 IDs")
     return aml, buffer
-
-
-MAX_TRAVEL_TIME = datetime.timedelta(minutes=120)
-MAX_WALKING_TIME = datetime.timedelta(minutes=45)
 
 
 def file_signature(path: Path) -> dict:

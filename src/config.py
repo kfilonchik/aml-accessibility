@@ -32,14 +32,6 @@ FEEDS: dict[str, str] = {
 #   "Barraqueiro Rodoeste" : "RDO_reconstructed_20261110.zip",
 }
 
-'''# ── Input geometries ──
-BGRI_PATH = DATA / "polygons" / "BRGI_AML_with_Parishes_singlepolyg.geojson"
-ORIGINS_PATH = DATA / "polygons" / "origins_v2021_single_polygon.geojson"
-PARISHES_PATH = DATA / "polygons" / "AML_TSI_parishes.geojson"
-
-# ── OSM extract for r5py's TransportNetwork ──
-OSM_PBF_AML_PATH = DATA / "polygons" / "aml.osm.pbf"'''
-
 # ── Departure: representative weekday morning commute ──
 DEPARTURE_DATE      = dt.date(2026, 11, 10)   # Tuesday, chosen for full GTFS calendar coverage; Easter week?
 DEPARTURE_TIME      = dt.time(8, 0)
@@ -61,7 +53,6 @@ ORIGIN_BATCH_SIZE = 2_000
 # Script 03 reduces the origin batch size when destinations are numerous.
 MAX_MATRIX_PAIRS_PER_BATCH = 1_000_000
 
-# To 000_prepare_osm.py
 # ── Input geometries ──
 BGRI_PATH        = DATA / "BRGI_AML_with_Parishes_singlepolyg.geojson"
 BGRI_BUFFER_PATH = DATA / "BGRI_BufferAML.geojson"
@@ -70,8 +61,11 @@ PARISHES_PATH    = DATA / "AML_TSI_parishes.geojson"
 
 LISBON_NAMES = {"Lisbon", "Lisboa"}
 
-# ── OSM extract for r5py's TransportNetwork ──
+# ── OSM extract for r5py's TransportNetwork (created by 02_build_network.py) ──
 OSM_PBF_URL_PT     = "https://download.geofabrik.de/europe/portugal-latest.osm.pbf"
 OSM_PBF_FULL_PATH  = DATA / "portugal-latest.osm.pbf"
 OSM_PBF_AML_PATH   = DATA / "aml_buffer_75km.osm.pbf"
 OSM_BBOX_BUFFER_M  = 75000   # metres, applied in CRS_PT before clipping
+
+MAX_TRAVEL_TIME = dt.timedelta(minutes=120)
+MAX_WALKING_TIME = dt.timedelta(minutes=45)
