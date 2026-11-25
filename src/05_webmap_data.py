@@ -1,175 +1,118 @@
-"""
-05_webmap_data.py
+"""Build the AML transit atlas with methodology, data, and GitHub controls.
 
-Assembles the parish-level dataset behind the webmap
-(output/webmap/aml_transit_atlas.html): joins the travel-sustainability
-index (01), mode share (01), accessibility metric (04) and an added
-travel-time-per-parish figure into a single parish.geojson, plus a
-municipality boundary/label layer dissolved from the same source.
-
-Travel time per parish: minutes needed to reach a given share of the AML's
-population (10% / 25% / 50%), summing destination population in ascending
-travel-time order until the threshold is crossed -- a standard cumulative-
-accessibility statistic (same family as "jobs reachable within 30/60 min").
-
-A plain unweighted mean travel time to every other BGRI cell was tried
-first and rejected: AML covers ~3,000 km^2, so the average distance between
-two random points in it is already ~25-30km, which is why that mean landed
-around 65-100 min for every parish -- technically correct but a poor proxy
-for "typical travel time", since it's dominated by far-flung cross-region
-pairs rather than by where people actually live. The population-threshold
-statistic answers a more meaningful question and stays directly comparable
-to the accessibility metric (04), which is also population-weighted.
-
-Read batch-by-batch like 04_accessibility_metric.py, since each batch
-already contains a complete row-block for its origins.
-
-Output (all under output/webmap/):
-  parish.geojson
-  municipalities.geojson
-  municipality_labels.geojson
+Place AML_accessibility_methodological_report.pdf in config.DATA/webmap/.
+The atlas build publishes the parish CSV beside the GeoJSON layers.
 """
 
-from __future__ import annotations
-
-import geopandas as gpd
-import numpy as np
-import pandas as pd
-
-from config import BGRI_PATH, BASE, DATA, MATRICES
-
-WEBMAP_DIR = BASE / "output" / "webmap"
-WEBMAP_DIR.mkdir(parents=True, exist_ok=True)
-
-STATS_DIR = DATA / "ine_statistics"
-PARISH_CONVERSION_PATH = DATA / "polygons" / "dtmnfr21_to_2024_parish_name_conversion.csv"
-PARISH_2024_GEOM_PATH = STATS_DIR / "IndicatorsFreguesia.geojson"
-
-POP_THRESHOLDS = [0.10, 0.25, 0.50]  # fractions of total AML population
+from importlib import import_module
+from pathlib import Path
+import re
+from shutil import copyfile
 
 
-def compute_time_to_population(pop_by_id: pd.Series) -> pd.DataFrame:
-    """For each BGRI origin, minutes needed to reach POP_THRESHOLDS shares of
-    the AML's total population, summing destination population (including
-    the origin's own cell, at travel_time=0) in ascending travel-time order.
-    NaN where even all reachable destinations together (<=120 min cap) don't
-    add up to that share -- i.e. "more than 120 min to reach that much
-    population from here"."""
-    total_pop = pop_by_id.sum()
-    thresholds = {f"time_to_pop_{int(f*100):02d}": f * total_pop for f in POP_THRESHOLDS}
+atlas = import_module("05_webmap_data")
+REPORT_NAME = "AML_accessibility_methodological_report.pdf"
+CSV_NAME = "AML_accessibility_parishes.csv"
 
-    batch_paths = sorted(MATRICES.glob("aml_matrix_batch_*.parquet"))
-    print(f"  Processing {len(batch_paths)} batch files for time-to-population-share …")
-    parts = {key: [] for key in thresholds}
-    for i, path in enumerate(batch_paths):
-        df = pd.read_parquet(path, columns=["from_id", "to_id", "travel_time"])
-        df = df.dropna(subset=["travel_time"])
-        df["pop_j"] = df["to_id"].map(pop_by_id).fillna(0.0)
-        df = df.sort_values(["from_id", "travel_time"])
-        df["cum_pop"] = df.groupby("from_id")["pop_j"].cumsum()
-        for key, threshold in thresholds.items():
-            reached = df[df["cum_pop"] >= threshold].groupby("from_id").first()["travel_time"]
-            parts[key].append(reached)
-        print(f"    batch {i+1}/{len(batch_paths)}: {path.name} done")
+KPI_ACTIONS = f"""
+        <a class="metric-btn atlas-action" href="{REPORT_NAME}" target="_blank"
+           rel="noopener" aria-label="ABOUT (methodological report, opens in a new tab)">ABOUT</a>
+        <button class="metric-btn atlas-action" type="button" id="atlas-data-button"
+                aria-haspopup="dialog" aria-controls="atlas-data-dialog">DATA</button>
+        <button class="metric-btn atlas-action atlas-github" type="button" disabled>GitHub</button>"""
 
-    out = pd.DataFrame({key: pd.concat(series_list) for key, series_list in parts.items()})
-    assert out.index.duplicated().sum() == 0
-    return out
+DATA_DIALOG = f"""
+<dialog id="atlas-data-dialog" aria-labelledby="atlas-data-title">
+  <h2 id="atlas-data-title">Download parish data</h2>
+  <div class="atlas-downloads">
+    <a class="metric-btn atlas-action" href="parish.geojson" download>GEOJSON</a>
+    <a class="metric-btn atlas-action" href="{CSV_NAME}" download>CSV</a>
+  </div>
+  <form method="dialog">
+    <button class="metric-btn atlas-action" type="submit" autofocus>Close</button>
+  </form>
+</dialog>
+<script>
+  document.getElementById("atlas-data-button").addEventListener("click", () => {{
+    document.getElementById("atlas-data-dialog").showModal();
+  }});
+</script>
+"""
+
+ACTION_STYLES = """
+.atlas-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  text-decoration: none;
+  font-weight: 600;
+  letter-spacing: .04em;
+}
+.atlas-action:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 2px; }
+.atlas-github { grid-column: 1 / -1; }
+.atlas-github:disabled { opacity: .6; cursor: default; border-color: var(--line); color: var(--ink-dim); }
+#atlas-data-dialog {
+  width: min(320px, calc(100% - 32px));
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow);
+}
+#atlas-data-dialog::backdrop { background: rgba(20, 30, 40, .5); }
+#atlas-data-dialog h2 { font-size: 14.5px; font-weight: 600; }
+.atlas-downloads { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0; }
+#atlas-data-dialog form { display: flex; justify-content: flex-end; }
+"""
+
+
+def render_html(template: str) -> str:
+    """Place ABOUT/DATA first, GitHub second, and the count cells third."""
+    # Reorder the enhanced page only; preserve each tab's attributes and label.
+    tab_pattern = r'(?P<indent>[ \t]*)<button\b[^>]*\bdata-tab="(?P<tab>sustain|mode|access|time)"[^>]*>.*?</button>'
+    matches = list(re.finditer(tab_pattern, template))
+    if len(matches) != 4 or {m.group("tab") for m in matches} != {"sustain", "mode", "access", "time"}:
+        raise ValueError("Expected exactly one button for each atlas tab")
+    buttons = {m.group("tab"): m.group(0) for m in matches}
+    ordered = iter(buttons[tab] for tab in ("sustain", "access", "time", "mode"))
+    template = re.sub(tab_pattern, lambda match: next(ordered), template)
+    kpi_row = '<div class="kpi-row">'
+    population_label = '<span class="l">Population</span></div>'
+    for anchor in (kpi_row, population_label, "</style>", "</body>"):
+        if template.count(anchor) != 1:
+            raise ValueError(f"Expected one atlas template marker: {anchor}")
+    return (
+        # Separate sibling sections inherit the sidebar's 14px gap. Using
+        # .block gives the counts the same border and 12px top padding as
+        # the BASE LAYER section below them.
+        template.replace(
+            kpi_row,
+            kpi_row + KPI_ACTIONS + '\n      </div>\n'
+            '      <div class="block atlas-kpi-section">\n        ' + kpi_row,
+            1,
+        )
+        .replace(population_label, population_label + '\n        </div>', 1)
+        .replace("</style>", ACTION_STYLES + "</style>", 1)
+        .replace("</body>", DATA_DIALOG + "</body>", 1)
+    )
+
+
+def write_html() -> Path:
+    """Publish the enhanced page and its CSV download."""
+    html = render_html(atlas.HTML_TEMPLATE.read_text(encoding="utf-8"))
+    copyfile(atlas.STATS_DIR / CSV_NAME, atlas.WEBMAP_DIR / CSV_NAME)
+    output = atlas.WEBMAP_DIR / "aml_transit_atlas.html"
+    output.write_text(html, encoding="utf-8")
+    return output
 
 
 def main() -> None:
-    print("=" * 78)
-    print("05  Assemble webmap parish dataset")
-    print("=" * 78)
-
-    print("\n[1] Computing time-to-population-share per BGRI cell …")
-    bgri = gpd.read_file(BGRI_PATH).rename(columns={"BGRI2021": "id"})
-    pop_by_id = bgri.set_index("id")["N_INDIVIDUOS"].astype(float)
-    time_to_pop = compute_time_to_population(pop_by_id)
-    tt_cols = list(time_to_pop.columns)
-
-    for col in tt_cols:
-        bgri[col] = bgri["id"].map(time_to_pop[col])
-        n_unreached = bgri[col].isna().sum()
-        print(f"    {col}: {n_unreached} / {len(bgri)} BGRI cells never reach that share within 120 min")
-
-    print("\n[2] Rolling up travel time to parish (population-weighted mean, 2016→2024 parish conversion) …")
-    parish_src = bgri.dropna(subset=["Dicofre"]).copy()
-    parish_src["Dicofre"] = parish_src["Dicofre"].astype(str).str.zfill(6)
-
-    # Same 2016 (dtmnfr16) -> 2024 (dtmnfr24) conversion as 04_accessibility_metric.py:
-    # weight=1 for the 114 non-split parishes, fractional (summing to 1 per
-    # old code) for the 4 that split into multiple 2024 parishes. Applied to
-    # both the numerator and denominator of the population-weighted mean.
-    conversion = pd.read_csv(PARISH_CONVERSION_PATH, dtype=str)
-    conversion["weight"] = conversion["weight"].astype(float)
-    conversion = conversion.rename(columns={"dtmnfr16": "Dicofre"})
-
-    parish_src = parish_src.merge(
-        conversion[["Dicofre", "dtmnfr24", "weight"]], on="Dicofre", how="left",
-    )
-    n_unmatched = parish_src["dtmnfr24"].isna().sum()
-    if n_unmatched:
-        print(f"    WARNING: {n_unmatched} BGRI rows have a Dicofre not found in the 2016->2024 "
-              f"conversion table -- dropping them from the rollup")
-        parish_src = parish_src.dropna(subset=["dtmnfr24"])
-
-    tt_by_parish_parts = {}
-    for col in tt_cols:
-        valid = parish_src.dropna(subset=[col])  # exclude from both numerator AND denominator
-        pop_w = valid["N_INDIVIDUOS"] * valid["weight"]
-        numerator = (valid[col] * pop_w).groupby(valid["dtmnfr24"]).sum()
-        denominator = pop_w.groupby(valid["dtmnfr24"]).sum()
-        tt_by_parish_parts[col] = numerator / denominator.replace(0, np.nan)
-    tt_by_parish = pd.DataFrame(tt_by_parish_parts)
-    tt_by_parish.index.name = "Dicofre"
-
-    print("\n[3] Joining sustainability, mode share, accessibility and travel time …")
-    access = pd.read_csv(STATS_DIR / "AML_accessibility_parishes.csv", dtype={"Dicofre": str})
-    for col in tt_cols:
-        access[col] = access["Dicofre"].map(tt_by_parish[col])
-
-    # Geometry: the real 2024 parish boundary layer (same one used by
-    # 04_accessibility_metric.py), not BGRI polygons dissolved by the old
-    # Dicofre code -- conversion weights are for statistic redistribution
-    # only and must never be used to approximate geometry.
-    parishes_2024 = gpd.read_file(PARISH_2024_GEOM_PATH)
-    parishes_2024["Dicofre"] = parishes_2024["id"].astype(str).str.zfill(6)
-    assert parishes_2024["Dicofre"].duplicated().sum() == 0, "duplicated Dicofre in 2024 geometry layer"
-    assert access["Dicofre"].duplicated().sum() == 0, "duplicated Dicofre in accessibility/statistics table"
-    unmatched_stats = set(access["Dicofre"]) - set(parishes_2024["Dicofre"])
-    print(f"    Statistics codes with no match in 2024 geometry layer: {len(unmatched_stats)} "
-          f"{sorted(unmatched_stats) if unmatched_stats else ''}")
-
-    parish = parishes_2024[["Dicofre", "geometry"]].merge(access, on="Dicofre", how="left")
-    assert len(parish) == len(parishes_2024), "row count changed across merge -- Dicofre not unique somewhere"
-    n_no_access = parish["access"].isna().sum()
-    print(f"    2024 geometry parishes with no accessibility value after join: {n_no_access}")
-
-    centroid_pt = parish.geometry.representative_point().to_crs("EPSG:4326")
-    parish["lon"] = centroid_pt.x
-    parish["lat"] = centroid_pt.y
-    parish = parish.to_crs("EPSG:4326")
-    parish["geometry"] = parish.geometry.simplify(0.0003, preserve_topology=True)
-    print(f"    {len(parish)} parishes assembled")
-
-    parish.to_file(WEBMAP_DIR / "parish.geojson", driver="GeoJSON")
-    print(f"\n  Saved {WEBMAP_DIR / 'parish.geojson'}")
-
-    print("\n[4] Building municipality boundary + label layers …")
-    muni_src = bgri.to_crs("EPSG:3763")
-    municipalities = muni_src[["Municipality", "geometry"]].dissolve("Municipality").reset_index()
-    municipalities = municipalities.to_crs("EPSG:4326")
-    municipalities["geometry"] = municipalities.geometry.simplify(0.0005, preserve_topology=True)
-    municipalities.to_file(WEBMAP_DIR / "municipalities.geojson", driver="GeoJSON")
-
-    labels = municipalities.copy()
-    labels["geometry"] = labels.to_crs("EPSG:3763").geometry.representative_point().to_crs("EPSG:4326")
-    labels[["Municipality", "geometry"]].to_file(WEBMAP_DIR / "municipality_labels.geojson", driver="GeoJSON")
-    print(f"  Saved {WEBMAP_DIR / 'municipalities.geojson'}")
-    print(f"  Saved {WEBMAP_DIR / 'municipality_labels.geojson'}")
-
-    print("\nDone.")
+    report = atlas.WEBMAP_DIR / REPORT_NAME
+    if not report.is_file():
+        raise FileNotFoundError(f"Place the methodological report at {report}")
+    atlas.main(publish_html=write_html)
 
 
 if __name__ == "__main__":
