@@ -18,8 +18,8 @@ travel time (no route found within the matrix's 120-min cap) is treated as
 an infinite travel time, so S(NaN) = 0 -- it contributes its population to
 the denominator but zero weight to the numerator, correctly dragging
 access_i down rather than being dropped from the average altogether.
-Population_other_i is therefore the fixed AML-wide total minus the origin's
-own population, the same for every origin. The origin itself (j = i,
+Population_other_i is the combined AML + buffer population minus the
+origin's own population. Only AML cells are origins. The origin itself (j = i,
 travel_time = 0) is EXCLUDED from both sums: including it would let a
 BGRI's own population dominate both numerator and denominator identically,
 which for the least-connected BGRIs (where the origin has no real transit
@@ -33,23 +33,27 @@ Parish aggregation (below) weights and averages access_i (not access_raw_i)
 by each BGRI's own population, Population_i, as a share of the parish's
 total population.
 
-Impedance function: S(x) = 1 / (1 + (x / x0)^k), the DfT Transport
-Connectivity Metric's calibrated "PT Overall" curve (x0=32.50, k=2.81),
-fitted on UK National Travel Survey travel-diary data. There is no
-Portuguese/AML travel-diary microdata in this repo to fit a local curve
-against, so these published parameters are used as-is (confirmed with the
-user) rather than a locally "calibrated" fit. A single curve is used
+access_raw_normalized_i = 100 * (access_raw_i - min(access_raw)) /
+(max(access_raw) - min(access_raw)), using all AML BGRI origins. Constant
+raw scores produce zero normalized scores. Parish values are population-weighted averages
+of these BGRI scores, with the existing parish conversion weights; parish
+scores are not normalized again. This relative 0-100 score is not a
+percentage of destination population.
+
+Impedance function: S(x) = 1 / (1 + (x / x0)^k), with x0 (minutes) and k
+configured by IMPEDANCE_X0 and IMPEDANCE_K in config.py. A single curve is used
 (rather than separate per-mode curves) because r5py's TravelTimeMatrix
 returns one blended door-to-door TRANSIT+WALK time per OD pair and does
 not expose which vehicle mode(s) made up a given trip -- ferry (boat_2)
 legs are not treated separately for the same reason; they're already
 folded into the same blended travel_time as every other PT leg.
 
-Travel time source: output/travel_matrix/aml_matrix_batch_*.parquet (see
-03_travel_time_matrices.py) -- read batch-by-batch rather than the merged
-671M-row aml_matrix.parquet, since each batch already contains a complete
-row-block (its origins x all 25,912 destinations), so per-origin sums can
-be computed one batch at a time without holding the full matrix in memory.
+Travel time sources: config.MATRICES/aml_matrix_batch_*.parquet and
+aml_to_buffer_batch_*.parquet (see 03_travel_time_matrices.py). Both complete
+matrix sets are required, with matching run manifests. Contributions from AML
+and buffer destinations are summed per AML origin, reading one batch at a time.
+Unreachable pairs, including omitted rows, contribute zero; the denominator is
+computed independently from all destination populations, excluding the origin.
 
 Output:
   data/AML_accessibility_bgri.geojson       (BGRI-cell level)
@@ -60,11 +64,16 @@ Output:
 
 from __future__ import annotations
 
+import argparse
+import json
+import warnings
+from pathlib import Path
+
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 
-from config import BGRI_PATH, DATA, MATRICES
+from config import BGRI_PATH, BGRI_BUFFER_PATH, DATA, MATRICES, IMPEDANCE_X0, IMPEDANCE_K
 
 STATS_DIR = DATA / "ine_statistics"
 PARISH_CONVERSION_PATH = DATA / "polygons" / "dtmnfr21_to_2024_parish_name_conversion.csv"
@@ -73,12 +82,6 @@ PARISH_CONVERSION_PATH = DATA / "polygons" / "dtmnfr21_to_2024_parish_name_conve
 # real 2024 boundaries rather than an approximation.
 PARISH_2024_GEOM_PATH = STATS_DIR / "IndicatorsFreguesia.geojson"
 
-# DfT Transport Connectivity Metric, "PT Overall" curve (NTS 2011-2023):
-# S(x) = 1 / (1 + (x / IMPEDANCE_X0) ** IMPEDANCE_K)
-IMPEDANCE_X0 = 32.50
-IMPEDANCE_K  = 2.81
-
-
 def impedance(travel_time_min: np.ndarray) -> np.ndarray:
     """Sigmoid decay weight in [0, 1]; NaN (unreachable within the matrix's
     120-min cap) maps to 0 weight, same as an infinitely long trip would."""
@@ -86,76 +89,198 @@ def impedance(travel_time_min: np.ndarray) -> np.ndarray:
     return np.where(np.isnan(travel_time_min), 0.0, weight)
 
 
-def load_population() -> pd.Series:
-    bgri = gpd.read_file(BGRI_PATH)[["BGRI2021", "N_INDIVIDUOS"]]
-    pop = bgri.set_index("BGRI2021")["N_INDIVIDUOS"].astype(float)
-    print(f"  Population loaded for {len(pop)} BGRI cells, total {pop.sum():,.0f}")
-    return pop
+def normalize_raw_accessibility(raw: pd.Series) -> pd.Series:
+    """Min-max scale raw scores across AML BGRIs; preserve missing values."""
+    if (raw.dropna() < 0).any() or np.isinf(raw.dropna()).any():
+        raise ValueError("Raw accessibility must be finite and nonnegative")
+    minimum, maximum = raw.min(), raw.max()
+    if maximum > minimum:
+        return 100.0 * (raw - minimum) / (maximum - minimum)
+    # Constant scores have no range: use zero and preserve missing values.
+    return raw * 0.0
 
 
-def compute_access(pop_by_id: pd.Series) -> pd.DataFrame:
-    """Per origin: access_raw (sum of impedance-weighted destination
-    population, over EVERY destination j != i) and pop_other (sum of
-    destination population over every j != i, regardless of whether that OD
-    pair was reachable) -- the denominator for the normalized access_i,
-    computed by the caller. A NaN travel_time (unreachable within the
-    matrix's 120-min cap) is treated as an infinite travel time: it still
-    counts its population in pop_other, but impedance() maps it to a 0
-    contribution to access_raw, so it correctly pulls access_i down instead
-    of being excluded from the average. Origin==destination pairs are
-    excluded from both sums (see module docstring): the metric is about
-    reaching OTHER BGRIs, not counting an origin's own population as part of
-    its own accessibility."""
-    batch_paths = sorted(MATRICES.glob("aml_matrix_batch_*.parquet"))
-    print(f"  Processing {len(batch_paths)} batch files …")
-    raw_parts = []
-    other_pop_parts = []
-    for i, path in enumerate(batch_paths):
-        df = pd.read_parquet(path, columns=["from_id", "to_id", "travel_time"])
-        df = df.loc[df["from_id"] != df["to_id"]]
-        df["pop_j"] = df["to_id"].map(pop_by_id).fillna(0.0)
-        df["contrib"] = impedance(df["travel_time"].to_numpy()) * df["pop_j"]
-        raw_parts.append(df.groupby("from_id")["contrib"].sum())
-        other_pop_parts.append(df.groupby("from_id")["pop_j"].sum())
-        print(f"    batch {i+1}/{len(batch_paths)}: {path.name} done")
-    access_raw = pd.concat(raw_parts)
-    pop_other = pd.concat(other_pop_parts)
-    assert access_raw.index.duplicated().sum() == 0, "origin appears in more than one batch"
-    return pd.DataFrame({"access_raw": access_raw, "pop_other": pop_other})
+
+def aggregate_parish_scores(parish_src: pd.DataFrame) -> pd.DataFrame:
+    """Average BGRI scores using population and parish conversion weights."""
+    parish_src = parish_src.copy()
+    parish_src["pop_w"] = parish_src["N_INDIVIDUOS"] * parish_src["weight"]
+    scores = ["access", "access_raw", "access_raw_normalized"]
+    aggregations = {
+        "N_INDIVIDUOS": ("pop_w", "sum"),
+        "Municipality": ("municipio_2024_nome_oficial", "first"),
+        "Freguesia": ("freguesia_2024_nome", "first"),
+    }
+    for score in scores:
+        column = f"numerator_{score}"
+        parish_src[column] = parish_src[score] * parish_src["pop_w"]
+        aggregations[column] = (column, "sum")
+    grouped = parish_src.groupby("dtmnfr24").agg(**aggregations).reset_index()
+    grouped = grouped.rename(columns={"dtmnfr24": "Dicofre"})
+    denominator = grouped["N_INDIVIDUOS"].replace(0, np.nan)
+    for score in scores:
+        grouped[score] = grouped.pop(f"numerator_{score}") / denominator
+    grouped["access_pct"] = 100 * grouped["access"]
+    return grouped
 
 
-def main() -> None:
+def load_population_file(path: Path) -> pd.Series:
+    bgri = gpd.read_file(path)[["BGRI2021", "N_INDIVIDUOS"]]
+    if bgri["BGRI2021"].isna().any():
+        raise ValueError(f"{path.name}: missing BGRI2021 IDs")
+    ids = bgri["BGRI2021"].astype(str).str.strip()
+    if ids.eq("").any() or ids.duplicated().any():
+        raise ValueError(f"{path.name}: IDs must be nonempty and unique")
+    population = pd.to_numeric(bgri["N_INDIVIDUOS"], errors="raise").astype(float)
+    if not np.isfinite(population).all() or (population < 0).any():
+        raise ValueError(f"{path.name}: population must be finite and nonnegative")
+    pop = pd.Series(population.to_numpy(), index=pd.Index(ids, name="BGRI2021"))
+    print(f"  {path.name}: {len(pop):,} BGRI cells, population {pop.sum():,.0f}")
+    return pop.sort_index()
+
+
+def load_population() -> tuple[pd.Series, pd.Series]:
+    """Keep origin population (AML) separate from external destination population."""
+    aml = load_population_file(BGRI_PATH)
+    buffer = load_population_file(BGRI_BUFFER_PATH)
+    if not aml.index.intersection(buffer.index).empty:
+        raise ValueError("AML and buffer datasets share BGRI2021 IDs")
+    return aml, buffer
+
+
+def matrix_batches(prefix: str, origin_count: int, destination_count: int) -> tuple[list[Path], dict]:
+    """Require all checkpoints so unfinished routing is not treated as unreachable."""
+    manifest_path = MATRICES / f"{prefix}_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing {manifest_path}; finish script 03 for both matrices first")
+    manifest = json.loads(manifest_path.read_text())
+    if manifest["origin_count"] != origin_count or manifest["destination_count"] != destination_count:
+        raise ValueError(f"{prefix}: population dataset sizes do not match the matrix manifest")
+    size = manifest["origin_batch_size"]
+    if not isinstance(size, int) or size <= 0:
+        raise ValueError(f"{prefix}: invalid origin batch size")
+    count = (origin_count + size - 1) // size
+    paths = [MATRICES / f"{prefix}_batch_{i:03d}.parquet" for i in range(count)]
+    if set(MATRICES.glob(f"{prefix}_batch_*.parquet")) != set(paths):
+        raise ValueError(f"{prefix}: missing or unexpected batch files; finish script 03 before script 04")
+    return paths, manifest
+
+
+def compute_access(
+    aml_pop: pd.Series, buffer_pop: pd.Series, *, allow_mixed_r5py_versions: bool = False,
+) -> pd.DataFrame:
+    """Sum both destination groups per AML origin, with a fixed population denominator.
+
+    All destination populations are included even if a travel time is NaN or
+    the pair is absent. Self-pairs contribute neither population nor impedance.
+    Batch boundaries may differ between the two matrices.
+    """
+    if not aml_pop.index.is_unique or not buffer_pop.index.is_unique:
+        raise ValueError("Population IDs must be unique")
+    if not aml_pop.index.intersection(buffer_pop.index).empty:
+        raise ValueError("AML and buffer population IDs must not overlap")
+    aml_pop = aml_pop.sort_index()
+    groups = []
+    for prefix, population in [("aml_matrix", aml_pop), ("aml_to_buffer", buffer_pop)]:
+        paths, manifest = matrix_batches(prefix, len(aml_pop), len(population))
+        groups.append((prefix, population, paths, manifest))
+    # Destination hashes/counts and batch sizes intentionally differ, but the
+    # origin set, network, date and routing settings must be the same.
+    shared_keys = [
+        "schema_version", "r5py_version", "departure", "departure_window_seconds",
+        "max_time_seconds", "max_walking_seconds", "transport_modes", "percentiles",
+        "origin_count", "origin_points_sha256", "inputs",
+    ]
+    for key in shared_keys:
+        if key not in groups[0][3] or key not in groups[1][3]:
+            raise ValueError(f"Matrix manifests are missing {key}")
+        if groups[0][3][key] != groups[1][3][key]:
+            if key == "r5py_version" and allow_mixed_r5py_versions:
+                warnings.warn(
+                    "Combining matrices generated with different r5py versions: "
+                    f"AML={groups[0][3][key]}, buffer={groups[1][3][key]}. "
+                    "Matching inputs/settings do not guarantee equivalent routing behavior.",
+                    RuntimeWarning,
+                )
+                continue
+            if key == "r5py_version":
+                raise ValueError(
+                    "AML and buffer matrix settings differ: r5py_version "
+                    f"(AML={groups[0][3][key]}, buffer={groups[1][3][key]}). "
+                    "Regenerate with the same version, or explicitly accept mixed versions "
+                    "with --allow-mixed-r5py-versions."
+                )
+            raise ValueError(f"AML and buffer matrix settings differ: {key}")
+    if groups[0][3]["percentiles"] != [50]:
+        raise ValueError("Accessibility requires percentile-50 matrices")
+
+    access_raw = pd.Series(0.0, index=aml_pop.index)
+    for prefix, population, paths, manifest in groups:
+        size = manifest["origin_batch_size"]
+        print(f"  Processing {prefix}: {len(paths)} batches …")
+        for i, path in enumerate(paths):
+            df = pd.read_parquet(path, columns=["from_id", "to_id", "travel_time"])
+            if df[["from_id", "to_id"]].isna().any().any():
+                raise ValueError(f"{path.name}: missing origin/destination IDs")
+            df["from_id"] = df["from_id"].astype(str).str.strip()
+            df["to_id"] = df["to_id"].astype(str).str.strip()
+            expected_origins = aml_pop.index[i * size:(i + 1) * size]
+            if not df["from_id"].isin(expected_origins).all():
+                raise ValueError(f"{path.name}: unexpected origins for this batch")
+            if not df["to_id"].isin(population.index).all():
+                raise ValueError(f"{path.name}: unknown or wrong-group destination IDs")
+            if df.duplicated(["from_id", "to_id"]).any():
+                raise ValueError(f"{path.name}: duplicate origin/destination pairs")
+            df = df.loc[df["from_id"] != df["to_id"]].copy()
+            times = pd.to_numeric(df["travel_time"], errors="raise").to_numpy(dtype=float)
+            if (times < 0).any():
+                raise ValueError(f"{path.name}: negative travel times")
+            df["contrib"] = impedance(times) * df["to_id"].map(population).to_numpy()
+            sums = df.groupby("from_id")["contrib"].sum()
+            access_raw.loc[sums.index] += sums
+            print(f"    batch {i+1}/{len(paths)}: {path.name} done")
+            del df
+    total_population = aml_pop.sum() + buffer_pop.sum()
+    return pd.DataFrame({"access_raw": access_raw, "pop_other": total_population - aml_pop})
+
+
+def main(*, allow_mixed_r5py_versions: bool = False) -> None:
     print("=" * 78)
     print("04  Simple PT accessibility-to-population metric (BGRI + parish)")
     print("=" * 78)
 
-    print("\n[1] Loading population …")
-    pop_by_id = load_population()
+    STATS_DIR.mkdir(parents=True, exist_ok=True)
+    print("\n[1] Loading AML and buffer destination population …")
+    aml_pop, buffer_pop = load_population()
 
     print("\n[2] Computing Access_i from travel-time batches …")
-    access = compute_access(pop_by_id)
+    access = compute_access(
+        aml_pop, buffer_pop, allow_mixed_r5py_versions=allow_mixed_r5py_versions,
+    )
 
     print("\n[3] Assembling BGRI-level output …")
     bgri = gpd.read_file(BGRI_PATH)
     bgri = bgri.rename(columns={"BGRI2021": "id"})
+    bgri["id"] = bgri["id"].astype(str).str.strip()
     bgri["access_raw"] = bgri["id"].map(access["access_raw"])
     bgri["pop_other"] = bgri["id"].map(access["pop_other"])
     n_missing = bgri["access_raw"].isna().sum()
     if n_missing:
         print(f"    WARNING: {n_missing} BGRI cells missing from the travel-time matrix (not routed)")
     # access_i = access_raw_i / Population_other_i -- a population-weighted
-    # average impedance over every other BGRI (unreachable ones included at
+    # average impedance over AML + buffer destinations (unreachable included at
     # weight 0, see module docstring). This, not access_raw, is what the
     # parish rollup below weights and averages.
     bgri["access"] = bgri["access_raw"] / bgri["pop_other"].replace(0, np.nan)
     bgri["access_pct"] = 100 * bgri["access"]
+    bgri["access_raw_normalized"] = normalize_raw_accessibility(bgri["access_raw"])
 
-    stats = bgri[["access_raw", "access"]].agg(["min", "mean", "median", "max"])
+    stats = bgri[["access_raw", "access", "access_raw_normalized"]].agg(["min", "mean", "median", "max"])
     print("\n  access_raw_i and access_i (normalized) summary statistics:")
     print(stats.to_string())
 
     bgri_cols = ["id", "Municipality", "Dicofre", "Freguesia", "N_INDIVIDUOS",
-                 "access_raw", "pop_other", "access", "access_pct"]
+                 "access_raw", "pop_other", "access", "access_pct", "access_raw_normalized"]
     bgri_out = bgri[bgri_cols + ["geometry"]].to_crs("EPSG:4326")
     bgri_out["geometry"] = bgri_out.geometry.simplify(0.0001, preserve_topology=True)
     bgri_out.to_file(DATA / "AML_accessibility_bgri.geojson", driver="GeoJSON")
@@ -226,24 +351,7 @@ def main() -> None:
               f"conversion table -- dropping them from the parish rollup")
         parish_src = parish_src.dropna(subset=["dtmnfr24"])
 
-    parish_src["pop_w"] = parish_src["N_INDIVIDUOS"] * parish_src["weight"]
-    parish_src["numerator"] = parish_src["access"] * parish_src["pop_w"]
-    # access_raw diagnostic, weighted-averaged the same way as access itself
-    # (not summed -- access_raw_i values from different BGRIs aren't
-    # additive into a meaningful parish total, only comparable as an average)
-    parish_src["numerator_raw"] = parish_src["access_raw"] * parish_src["pop_w"]
-
-    grouped = parish_src.groupby("dtmnfr24").agg(
-        N_INDIVIDUOS=("pop_w", "sum"),
-        numerator_sum=("numerator", "sum"),
-        numerator_raw_sum=("numerator_raw", "sum"),
-        Municipality=("municipio_2024_nome_oficial", "first"),
-        Freguesia=("freguesia_2024_nome", "first"),
-    ).reset_index().rename(columns={"dtmnfr24": "Dicofre"})
-    grouped["access"] = grouped["numerator_sum"] / grouped["N_INDIVIDUOS"].replace(0, np.nan)
-    grouped["access_pct"] = 100 * grouped["access"]
-    grouped["access_raw"] = grouped["numerator_raw_sum"] / grouped["N_INDIVIDUOS"].replace(0, np.nan)
-    grouped = grouped.drop(columns=["numerator_sum", "numerator_raw_sum"])
+    grouped = aggregate_parish_scores(parish_src)
 
     # TSI (01_sustainability_index.py) is computed at the 118 dtmnfr16
     # parishes and hasn't itself been split onto 2024 boundaries, so for the
@@ -264,7 +372,8 @@ def main() -> None:
     print(parish_stats.to_string())
 
     parish_cols = ["Dicofre", "Freguesia", "Municipality", "N_INDIVIDUOS",
-                    "access", "access_pct", "access_raw", "pct_active", "pct_pt", "pct_car", "pct_zero_car", "TSI"]
+                    "access", "access_pct", "access_raw", "access_raw_normalized",
+                    "pct_active", "pct_pt", "pct_car", "pct_zero_car", "TSI"]
 
     # Geometry: use the actual 2024 parish boundary layer -- conversion
     # weights are for statistic redistribution only and must never be used
@@ -312,4 +421,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Combine AML and buffer accessibility contributions.")
+    parser.add_argument(
+        "--allow-mixed-r5py-versions", action="store_true",
+        help="Accept matrices generated with different r5py versions; all other checks remain enabled.",
+    )
+    main(allow_mixed_r5py_versions=parser.parse_args().allow_mixed_r5py_versions)
