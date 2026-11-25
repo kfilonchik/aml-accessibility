@@ -1,73 +1,100 @@
 """
 02_build_network.py
 
-Builds the r5py.TransportNetwork from the AML OSM extract and the zipped
-GTFS feeds (config.FEEDS), then runs a tiny smoke-test travel-time query
-(Alameda -> Marquês de Pombal, two Lisbon metro stations a few stops
-apart) to confirm the JVM, network build, and routing all work before
-committing to the full BGRI-to-BGRI matrix in 03_travel_time_matrices.py.
+Prepares the OSM street extract that 03_travel_time_matrices.py needs:
+downloads the Portugal extract (Geofabrik) and clips it to the AML bounding
+box plus config.OSM_BBOX_BUFFER_M, writing config.OSM_PBF_AML_PATH.
+
+Files that already exist are reused, so rerunning is safe. The routable
+network itself is built (and cached) by r5py in script 03.
+
+Clipping needs the `osmium` command:
+  conda install -c conda-forge osmium-tool
 """
 
 from __future__ import annotations
 
-import datetime
+import shutil
+import subprocess
+import sys
+import urllib.request
 
 import geopandas as gpd
-import r5py
-from shapely.geometry import Point
 
-from config import CRS_WGS, DEPARTURE_DATETIME, FEEDS, GTFS_ZIPS, OSM_PBF_AML_PATH
-
-
-def build_network() -> r5py.TransportNetwork:
-    gtfs_zip_paths = [GTFS_ZIPS / filename for filename in FEEDS.values()]
-    missing = [p for p in gtfs_zip_paths if not p.exists()]
-    if missing:
-        raise FileNotFoundError(f"Missing GTFS zips: {missing}")
-    print(f"  OSM PBF: {OSM_PBF_AML_PATH}")
-    print(f"  GTFS zips ({len(gtfs_zip_paths)}): {[p.name for p in gtfs_zip_paths]}")
-    network = r5py.TransportNetwork(str(OSM_PBF_AML_PATH), [str(p) for p in gtfs_zip_paths])
-    print("  TransportNetwork built OK.")
-    return network
+from config import (
+    CRS_PT, CRS_WGS, OSM_BBOX_BUFFER_M, OSM_PBF_AML_PATH, OSM_PBF_FULL_PATH,
+    OSM_PBF_URL_PT, PARISHES_PATH,
+)
 
 
-def smoke_test(network: r5py.TransportNetwork) -> None:
-    origin = gpd.GeoDataFrame(
-        {"id": ["Alameda"]}, geometry=[Point(-9.134086, 38.737255)], crs=CRS_WGS
-    )
-    destination = gpd.GeoDataFrame(
-        {"id": ["Marques_de_Pombal"]}, geometry=[Point(-9.150807, 38.72488)], crs=CRS_WGS
-    )
-    ttm = r5py.TravelTimeMatrix(
-        network,
-        origins=origin,
-        destinations=destination,
-        departure=DEPARTURE_DATETIME,
-        transport_modes=[r5py.TransportMode.TRANSIT, r5py.TransportMode.WALK],
-        max_time=datetime.timedelta(minutes=120),
-        max_time_walking=datetime.timedelta(minutes=45),
-    )
-    print("\n  Smoke-test travel time matrix:")
-    print(ttm.to_string())
-    if ttm.empty or ttm["travel_time"].isna().all():
-        raise RuntimeError("Smoke test produced no reachable route — investigate before proceeding.")
-    print(f"\n  Alameda -> Marquês de Pombal median travel time: "
-          f"{ttm['travel_time'].iloc[0]:.1f} min")
+def download_full_extract() -> None:
+    if OSM_PBF_FULL_PATH.exists():
+        print(f"  Already present: {OSM_PBF_FULL_PATH.name} "
+              f"({OSM_PBF_FULL_PATH.stat().st_size / 1e6:.0f} MB) — skipping download")
+        return
+    print(f"  Downloading {OSM_PBF_URL_PT} -> {OSM_PBF_FULL_PATH} …")
+    # Rename only when complete, so an interrupted download is never reused.
+    temporary = OSM_PBF_FULL_PATH.with_name(f"tmp_{OSM_PBF_FULL_PATH.name}")
+    urllib.request.urlretrieve(OSM_PBF_URL_PT, temporary)
+    temporary.replace(OSM_PBF_FULL_PATH)
+    print(f"  Downloaded {OSM_PBF_FULL_PATH.stat().st_size / 1e6:.0f} MB")
+
+
+def compute_aml_bbox_wgs84() -> tuple[float, float, float, float]:
+    parishes = gpd.read_file(PARISHES_PATH)
+    minx, miny, maxx, maxy = parishes.to_crs(CRS_PT).total_bounds
+    buffered = gpd.GeoSeries(
+        gpd.points_from_xy([minx, maxx], [miny, maxy]), crs=CRS_PT
+    ).buffer(OSM_BBOX_BUFFER_M)
+    minx2, miny2, maxx2, maxy2 = buffered.total_bounds
+    bbox_gdf = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy([minx2, maxx2], [miny2, maxy2]), crs=CRS_PT
+    ).to_crs(CRS_WGS)
+    lon_min, lat_min, lon_max, lat_max = bbox_gdf.total_bounds
+    print(f"  AML bbox (WGS84, +{OSM_BBOX_BUFFER_M}m buffer): "
+          f"[{lon_min:.4f}, {lat_min:.4f}, {lon_max:.4f}, {lat_max:.4f}]")
+    return lon_min, lat_min, lon_max, lat_max
+
+
+def clip_to_aml(bbox_wgs84: tuple[float, float, float, float]) -> None:
+    bbox_str = ",".join(str(value) for value in bbox_wgs84)
+    # The temporary name must keep the .osm.pbf suffix: osmium infers the
+    # output format from it.
+    temporary = OSM_PBF_AML_PATH.with_name(f"tmp_{OSM_PBF_AML_PATH.name}")
+    cmd = [
+        "osmium", "extract", "--bbox", bbox_str,
+        "--overwrite", "-o", str(temporary), str(OSM_PBF_FULL_PATH),
+    ]
+    print(f"  Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(result.stdout)
+        print(result.stderr)
+        sys.exit(f"osmium extract failed (exit {result.returncode})")
+    temporary.replace(OSM_PBF_AML_PATH)
+    print(f"  Clipped to {OSM_PBF_AML_PATH.stat().st_size / 1e6:.0f} MB")
 
 
 def main() -> None:
     print("=" * 78)
-    print("02  Build r5py TransportNetwork and smoke-test routing")
+    print("02  Prepare OSM PBF extract for r5py (AML + buffer)")
     print("=" * 78)
-    print(f"\n  Departure: {DEPARTURE_DATETIME}")
 
-    print("\n[1] Building TransportNetwork …")
-    network = build_network()
+    if OSM_PBF_AML_PATH.exists():
+        print(f"  Already present: {OSM_PBF_AML_PATH} "
+              f"({OSM_PBF_AML_PATH.stat().st_size / 1e6:.0f} MB) — nothing to do")
+        return
+    if shutil.which("osmium") is None:
+        sys.exit("The 'osmium' command was not found. Install it with: "
+                 "conda install -c conda-forge osmium-tool")
 
-    print("\n[2] Smoke test …")
-    smoke_test(network)
-
-    print("\nDone — network builds and routes correctly.")
+    print("\n[1] Downloading full Portugal extract …")
+    download_full_extract()
+    print("\n[2] Computing AML bounding box from parish geometries …")
+    bbox = compute_aml_bbox_wgs84()
+    print("\n[3] Clipping to AML bbox with osmium-tool …")
+    clip_to_aml(bbox)
+    print("\nDone.")
 
 
 if __name__ == "__main__":

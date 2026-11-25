@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # run_travel_time_matrix.sh
 #
-# Launches the r5py travel-time-matrix pipeline (02_build_network.py smoke
-# test, then 03_travel_time_matrices.py) in the background, using the
-# "r5geo" conda env, and survives the terminal/SSH session closing.
+# Checks that the OSM extract exists (if not, creates it in the foreground
+# with 02_build_network.py), then launches 03_travel_time_matrices.py in the
+# background, using the "r5geo" conda env. Once 03 has started, it survives
+# the terminal/SSH session closing.
 #
 # Usage:
 #   ./run_travel_time_matrix.sh          # start in background
@@ -39,12 +40,25 @@ PYTHON_BIN="${CONDA_ENV_PATH}/bin/python"
 
 cd "${SCRIPT_DIR}"
 
-if ! nohup "${PYTHON_BIN}" -u 02_build_network.py > "${LOG_FILE}" 2>&1; then
-    echo "02_build_network.py failed — last 30 lines of ${LOG_FILE}:" >&2
-    tail -n 30 "${LOG_FILE}" >&2
-    exit 1
+# Ask config.py for the path so it is defined in one place only.
+OSM_PBF="$("${PYTHON_BIN}" -c 'from config import OSM_PBF_AML_PATH; print(OSM_PBF_AML_PATH)')"
+
+if [[ -s "${OSM_PBF}" ]]; then
+    echo "OSM extract found: ${OSM_PBF}"
+else
+    echo "OSM extract missing: ${OSM_PBF}"
+    echo "Running 02_build_network.py to create it (log: ${LOG_FILE}) …"
+    if ! nohup "${PYTHON_BIN}" -u 02_build_network.py > "${LOG_FILE}" 2>&1; then
+        echo "02_build_network.py failed — last 30 lines of ${LOG_FILE}:" >&2
+        tail -n 30 "${LOG_FILE}" >&2
+        exit 1
+    fi
+    if [[ ! -s "${OSM_PBF}" ]]; then
+        echo "02_build_network.py finished but ${OSM_PBF} is missing or empty." >&2
+        exit 1
+    fi
+    echo "[02_build_network.py OK, see ${LOG_FILE}]" >> "${LOG_FILE}"
 fi
-echo "[02_build_network.py OK, see ${LOG_FILE}]" >> "${LOG_FILE}"
 
 nohup "${PYTHON_BIN}" -u 03_travel_time_matrices.py >> "${LOG_FILE}" 2>&1 &
 echo $! > "${PID_FILE}"
